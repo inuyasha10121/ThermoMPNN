@@ -1,7 +1,8 @@
+import numpy as np
 import torch
 import torch.nn as nn
-from protein_mpnn_utils import ProteinMPNN, tied_featurize
-from model_utils import featurize
+from .protein_mpnn_utils import ProteinMPNN, tied_featurize
+from .model_utils import featurize
 import os
 
 
@@ -15,7 +16,12 @@ SUBTRACT_MUT = True
 
 
 def get_protein_mpnn(cfg, version='v_48_020.pt'):
-    """Loading Pre-trained ProteinMPNN model for structure embeddings"""
+    """Loading Pre-trained ProteinMPNN model for structure embeddings
+    
+    Arguments:
+        cfg: Configuration information
+        version: Version of model to load
+    """
     hidden_dim = 128
     num_layers = 3 
 
@@ -73,51 +79,51 @@ class TransferModel(nn.Module):
         self.ddg_out = nn.Linear(1, 1)
 
     def forward(self, pdb, mutations, tied_feat=True):        
+        #Get number of mutations
+        num_mutations = len(mutations)
+
+        #Get device to run everything on
         device = next(self.parameters()).device
 
+        #Featurize input PDB
         X, S, mask, lengths, chain_M, chain_encoding_all, chain_list_list, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, dihedral_mask, tied_pos_list_of_lists_list, pssm_coef, pssm_bias, pssm_log_odds_all, bias_by_res_all, tied_beta = tied_featurize([pdb[0]], device, None, None, None, None, None, None, ca_only=False)
 
-        # getting ProteinMPNN structure embeddings
+        # Get ProteinMPNN structure embeddings
         all_mpnn_hid, mpnn_embed, _ = self.prot_mpnn(X, S, mask, chain_M, residue_idx, chain_encoding_all, None)
+
+        #Setup input space, modified by if final layers are present
+        aa_index_mut = np.zeros(num_mutations, dtype=np.int16)
+        aa_index_wt = np.zeros(num_mutations, dtype=np.int16)
+        mut_positions = np.zeros(num_mutations, dtype=np.int16)
+        for i in range(num_mutations):
+            aa_index_mut[i] = ALPHABET.index(mutations[i].mutation)
+            aa_index_wt[i] = ALPHABET.index(mutations[i].wildtype)
+            mut_positions[i] = mutations[i].position
+        
+        mpnn_embed_size = mpnn_embed[0][0].shape[0]
+        batch_indexer = np.arange(num_mutations)
         if self.num_final_layers > 0:
             mpnn_hid = torch.cat(all_mpnn_hid[:self.num_final_layers], -1)
+            mpnn_hid_size = mpnn_hid[0][0].shape[0]
+            input = torch.zeros((num_mutations, mpnn_embed_size + mpnn_hid_size, 1), dtype=torch.float32, device=device)
+            mpnn_hid[0][mut_positions]
+            input[batch_indexer, :mpnn_hid_size, 0] = mpnn_hid[0][mut_positions]
+            input[batch_indexer, mpnn_hid_size:, 0] = mpnn_embed[0][mut_positions]
 
-        out = []
-        for mut in mutations:
-            inputs = []
-            if mut is None:
-                out.append(None)
-                continue
+        else:
+            input = torch.zeros((num_mutations, mpnn_embed_size, 1), dtype=torch.float32, device=device)
+            input[batch_indexer, :, 0] = mpnn_embed[0][mut_positions]
 
-            aa_index = ALPHABET.index(mut.mutation)
-            wt_aa_index = ALPHABET.index(mut.wildtype)
+        if self.lightattn:
+            input = self.light_attention(input, None)
 
-            if self.num_final_layers > 0:
-                hid = mpnn_hid[0][mut.position]  # MPNN hidden embeddings at mut position
-                inputs.append(hid)
-
-            embed = mpnn_embed[0][mut.position]  # MPNN seq embeddings at mut position
-            inputs.append(embed)
-
-            # concatenating hidden layers and embeddings
-            lin_input = torch.cat(inputs, -1)
-
-            # passing vector through lightattn
-            if self.lightattn:
-                lin_input = torch.unsqueeze(torch.unsqueeze(lin_input, -1), 0)
-                lin_input = self.light_attention(lin_input, mask)
-
-            both_input = torch.unsqueeze(self.both_out(lin_input), -1)
-            ddg_out = self.ddg_out(both_input)
-
-            if self.subtract_mut:
-                ddg = ddg_out[aa_index][0] - ddg_out[wt_aa_index][0]
-            else:
-                ddg = ddg_out[aa_index][0]
-
-            out.append({
-                "ddG": torch.unsqueeze(ddg, 0),
-            })
+        both_input = self.both_out(input).unsqueeze(-1)
+        ddg_out = self.ddg_out(both_input)
+        if self.subtract_mut:
+            ddg = ddg_out[batch_indexer,aa_index_mut] - ddg_out[batch_indexer, aa_index_wt]
+        else:
+            ddg = ddg_out[batch_indexer,aa_index_mut]
+        out = [{"ddG": x} for x in ddg]
         return out, None
 
 

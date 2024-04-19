@@ -10,8 +10,8 @@ from tqdm import tqdm
 from dataclasses import dataclass
 from typing import Optional
 
-from protein_mpnn_utils import alt_parse_PDB, parse_PDB
-from cache import cache
+from .protein_mpnn_utils import alt_parse_PDB, parse_PDB
+from .cache import cache
 
 
 ALPHABET = 'ACDEFGHIKLMNPQRSTVWY-'
